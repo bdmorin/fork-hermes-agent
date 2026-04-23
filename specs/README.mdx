@@ -1,0 +1,32 @@
+---
+title: "Customization Specs — bdmorin/fork-hermes-agent"
+created: 2026-04-23T20:45:00Z
+type: index
+---
+
+# Soft Fork Customization Specs
+
+This directory contains specs for customizations applied to hermes-agent on the
+`bdm/customizations` branch. Each spec is the durable artifact — code may need
+to be rewritten when upstream changes break it, but the spec survives.
+
+## Workflow
+
+1. Write the spec (what, why, integration points, test plan)
+2. Implement on `bdm/customizations` branch
+3. When upstream updates break something, rebase and consult the spec to rewrite
+4. `origin` = NousResearch/hermes-agent (upstream)
+5. `fork` = bdmorin/fork-hermes-agent (our copy)
+
+## Rebase strategy
+
+```bash
+git fetch origin
+git rebase origin/main
+# Fix conflicts, consult specs for intent
+git push fork bdm/customizations --force-with-lease
+```
+
+## Specs
+
+- [001-slack-channel-tools](20260423-204500-001-slack-channel-tools.mdx) — Expose Slack API methods as agent-callable tools

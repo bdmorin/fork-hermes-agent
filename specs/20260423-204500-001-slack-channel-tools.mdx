@@ -1,0 +1,180 @@
+---
+title: "Spec 001: Slack Channel Tools"
+created: 2026-04-23T20:45:00Z
+author: bdmorin
+type: spec
+status: ready
+priority: P0
+upstream_files_touched:
+  - tools/slack_tool.py (new)
+  - toolsets.py (register in hermes-slack toolset)
+pattern_reference: tools/discord_tool.py
+slack_scopes_required:
+  - channels:manage
+  - pins:read
+  - pins:write
+  - reactions:read
+tags:
+  - slack
+  - tools
+  - agent-capabilities
+---
+
+# Spec 001: Slack Channel Tools
+
+## Problem
+
+Hermes Slack adapter implements `reactions_add`, `reactions_remove`, `chat_update`,
+`conversations_replies`, `files_upload_v2`, and more — but none of these are exposed
+as LLM-callable tools. The agent literally doesn't know it can use them.
+
+## Solution
+
+Create `tools/slack_tool.py` following the exact pattern of `tools/discord_tool.py`:
+- Single tool registration (`slack_channel`) in the `slack` toolset
+- Action-based dispatch via `_ACTIONS` dict
+- Direct Slack Web API calls via `urllib.request` (no adapter dependency)
+- Config-based action allowlist at `slack.channel_actions`
+
+## Pattern (from discord_tool.py)
+
+```
+1. _ACTIONS dict: action_name → handler function
+2. _ACTION_MANIFEST: (name, signature, description) for schema generation
+3. _REQUIRED_PARAMS: per-action param validation
+4. _build_schema(): generates OpenAI tool schema from manifest
+5. Handler functions: each makes one Slack Web API call, returns formatted result
+6. registry.register(): name, toolset, schema, handler, requires_env
+```
+
+## Actions
+
+### Tier 1 — High value, existing adapter support
+
+| Action | Slack API Method | Params | Notes |
+|--------|-----------------|--------|-------|
+| `react` | `reactions.add` / `reactions.remove` | channel, timestamp, emoji, action=add\|remove | Emoji name without colons |
+| `edit_message` | `chat.update` | channel, ts, text | Can only edit bot's own messages |
+| `delete_message` | `chat.delete` | channel, ts | Can only delete bot's own messages |
+| `fetch_messages` | `conversations.history` | channel, limit?, latest?, oldest? | Returns recent messages |
+| `thread_replies` | `conversations.replies` | channel, ts, limit? | Fetch thread contents |
+| `upload_file` | `files.uploadV2` | channel, content, filename, title? | Upload text/file content |
+
+### Tier 2 — Channel management
+
+| Action | Slack API Method | Params | Notes |
+|--------|-----------------|--------|-------|
+| `set_topic` | `conversations.setTopic` | channel, topic | Needs channels:manage scope |
+| `set_purpose` | `conversations.setPurpose` | channel, purpose | Needs channels:manage scope |
+| `list_pins` | `pins.list` | channel | Needs pins:read scope |
+| `pin_message` | `pins.add` | channel, timestamp | Needs pins:write scope |
+| `unpin_message` | `pins.remove` | channel, timestamp | Needs pins:write scope |
+
+### Tier 3 — Discovery/info
+
+| Action | Slack API Method | Params | Notes |
+|--------|-----------------|--------|-------|
+| `list_channels` | `conversations.list` | limit? | Bot's channels only |
+| `channel_info` | `conversations.info` | channel | Topic, purpose, member count |
+| `user_info` | `users.info` | user | Display name, status, timezone |
+| `list_users` | `users.list` | limit? | Workspace members |
+
+## Implementation Details
+
+### File: `tools/slack_tool.py`
+
+```python
+# Helper — all Slack API calls go through this
+def _slack_request(method: str, endpoint: str, data: dict) -> dict:
+    token = os.getenv("SLACK_BOT_TOKEN", "")
+    url = f"https://slack.com/api/{endpoint}"
+    # POST with JSON body, Authorization: Bearer header
+    # Return parsed JSON, raise on errors
+```
+
+### Handler example
+
+```python
+def _react(channel: str, timestamp: str, emoji: str,
+           action: str = "add", **kw) -> str:
+    endpoint = f"reactions.{'add' if action == 'add' else 'remove'}"
+    result = _slack_request("POST", endpoint, {
+        "channel": channel,
+        "timestamp": timestamp,
+        "name": emoji,  # without colons
+    })
+    return f"{'Added' if action == 'add' else 'Removed'} :{emoji}: reaction"
+```
+
+### Registration
+
+```python
+registry.register(
+    name="slack_channel",
+    toolset="slack",
+    schema=_build_schema(list(_ACTIONS.keys())),
+    handler=lambda args, **kw: slack_channel(
+        action=args.get("action", ""),
+        channel=args.get("channel", ""),
+        timestamp=args.get("timestamp", ""),
+        # ... all params
+    ),
+    check_fn=_check_requirements,
+    requires_env=["SLACK_BOT_TOKEN"],
+)
+```
+
+### Toolset registration
+
+In `toolsets.py`, ensure `slack_channel` is included in the `hermes-slack` toolset
+(or the `slack` toolset if that's the canonical name).
+
+## Config allowlist
+
+```yaml
+# config.yaml
+slack:
+  channel_actions: ""  # empty = all actions available
+  # Or restrict:
+  # channel_actions: react, fetch_messages, edit_message
+```
+
+## Slack App OAuth Scopes to Add
+
+Go to api.slack.com → App → OAuth & Permissions → Scopes → Add:
+- `channels:manage` — set topic/purpose
+- `pins:read` — list pins
+- `pins:write` — pin/unpin
+- `reactions:read` — list reactions on messages
+
+Current scopes (keep): `app_mentions:read`, `channels:history`, `channels:read`,
+`chat:write`, `files:read`, `files:write`, `groups:history`, `groups:read`,
+`im:history`, `im:read`, `im:write`, `users:read`
+
+After adding scopes, reinstall the app to the workspace.
+
+## Test Plan
+
+1. Deploy to `bdm/customizations`, restart gateway
+2. In Slack: `@wazzupbot react to my last message with 🎉`
+3. Verify emoji appears on the message
+4. `@wazzupbot what are the recent messages in this channel?`
+5. Verify agent returns message history
+6. `@wazzupbot set the channel topic to "Hermes testing ground"`
+7. Verify topic changes
+8. `@wazzupbot pin your last message`
+9. Verify pin appears
+10. `@wazzupbot what can you do in this channel now?`
+11. Verify agent correctly describes its Slack capabilities
+
+## Rebase Notes
+
+If upstream adds their own Slack tool:
+- Compare action coverage — keep ours if theirs is a subset
+- If theirs is equivalent or better, delete ours and adopt
+- Key differentiator: our config allowlist pattern from discord_tool.py
+
+Integration points that may break on rebase:
+- `tools/registry.py` — if registry API changes
+- `toolsets.py` — if toolset registration changes
+- Tool schema format — if they change the OpenAI function calling schema structure
